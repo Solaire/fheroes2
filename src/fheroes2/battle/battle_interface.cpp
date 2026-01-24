@@ -113,6 +113,8 @@ namespace
 
     const int32_t battleLogElementWidth{ fheroes2::Display::DEFAULT_WIDTH - 32 - 16 };
 
+    static constexpr std::array<int32_t, Battle::Board::heightInCells> moatCellIds{ 7, 18, 28, 39, 49, 61, 72, 84, 95 };
+
     struct LightningPoint
     {
         explicit LightningPoint( const fheroes2::Point & p = fheroes2::Point(), const int32_t thick = 1 )
@@ -2029,6 +2031,7 @@ fheroes2::Point Battle::Interface::_drawTroopSprite( const Unit & unit, const fh
 {
     // Get the sprite rendering offset.
     fheroes2::Point offset = GetTroopPosition( unit, troopSprite );
+    fheroes2::Point movementDelta{ 0, 0 };
 
     if ( _movingUnit == &unit ) {
         // Monster is moving.
@@ -2051,8 +2054,11 @@ fheroes2::Point Battle::Interface::_drawTroopSprite( const Unit & unit, const fh
             }
             // If the creature has to move diagonally.
             else if ( moveY != 0 ) {
-                offset.x -= Sign( moveX ) * ( _movingUnit->animation.getCurrentFrameXOffset() ) / 2;
-                offset.y += static_cast<int32_t>( _movingUnit->animation.movementProgress() * moveY );
+                movementDelta.x -= Sign( moveX ) * ( _movingUnit->animation.getCurrentFrameXOffset() ) / 2;
+                movementDelta.y = static_cast<int32_t>( _movingUnit->animation.movementProgress() * moveY );
+
+                offset.x += movementDelta.x;
+                offset.y += movementDelta.y;
             }
         }
     }
@@ -2069,9 +2075,148 @@ fheroes2::Point Battle::Interface::_drawTroopSprite( const Unit & unit, const fh
         offset.y += moveY + static_cast<int32_t>( ( _movingPos.y - _flyingPos.y ) * movementProgress );
     }
 
+    if ( _drawTroopSpriteWithMoatMask( unit, troopSprite, offset, movementDelta ) ) {
+        return offset;
+    }
+
     fheroes2::AlphaBlit( troopSprite, _mainSurface, offset.x, offset.y, unit.GetCustomAlpha(), unit.isReflect() );
 
     return offset;
+}
+
+bool Battle::Interface::_drawTroopSpriteWithMoatMask( const Unit & unit, const fheroes2::Sprite & sprite, const fheroes2::Point & offset,
+                                                      const fheroes2::Point & movementDelta /* = { 0, 0 } */ )
+{
+    const Castle * castle = Arena::GetCastle();
+    if ( castle == nullptr || !castle->isBuild( BUILD_MOAT ) ) {
+        return false;
+    }
+
+    if ( _flyingUnit == &unit ) {
+        return false;
+    }
+
+    const Cell * cell = _getMoatVisualCell( unit );
+    if ( cell == nullptr ) {
+        return false;
+    }
+    fheroes2::Rect mask = _getMoatMask( *cell );
+
+    // Special cases:
+    // - Central moat tile has more land at start, but more water into adjacent tile
+    // - Bottom moat tile has more water when wall is destroyed
+    if ( cell->GetIndex() == 49 ) {
+        mask.x += ( Cell::widthPx / 4 );
+        mask.width += ( Cell::widthPx / 4 );
+    }
+    else if ( cell->GetIndex() == 95 ) {
+        mask.width += ( Cell::widthPx / 4 );
+    }
+
+    // Shift mask to follow sprite during movement
+    mask.x -= movementDelta.x;
+    mask.y += movementDelta.y;
+
+    const fheroes2::Rect spriteRect{ offset.x, offset.y, sprite.width(), sprite.height() };
+
+    const auto intersection = spriteRect ^ mask;
+    if ( intersection.width == 0 && intersection.height == 0 ) {
+        return false;
+    }
+
+    // Account for short sprites (e.g. vampire dead sprite)
+    constexpr int minVisibleHeight = 10;
+    if ( sprite.height() - mask.height < minVisibleHeight ) {
+        return false;
+    }
+
+    for ( int y = 0; y < sprite.height(); ++y ) {
+        const int screenY = offset.y + y;
+
+        // Scanline outside mask vertically
+        if ( screenY < mask.y || screenY >= mask.y + mask.height ) {
+            fheroes2::AlphaBlit( sprite, 0, y, _mainSurface, offset.x, screenY, sprite.width(), 1, unit.GetCustomAlpha(), unit.isReflect() );
+            continue;
+        }
+
+        // Left visible segment
+        const int leftWidth = std::max( 0, mask.x - offset.x );
+        if ( leftWidth > 0 ) {
+            fheroes2::AlphaBlit( sprite, 0, y, _mainSurface, offset.x, screenY, leftWidth, 1, unit.GetCustomAlpha(), unit.isReflect() );
+        }
+
+        // Right visible segment
+        const int rightStart = mask.x + mask.width;
+        const int rightWidth = ( offset.x + sprite.width() ) - rightStart;
+        if ( rightWidth > 0 ) {
+            fheroes2::AlphaBlit( sprite, sprite.width() - rightWidth, y, _mainSurface, rightStart, screenY, rightWidth, 1, unit.GetCustomAlpha(), unit.isReflect() );
+        }
+    }
+    return true;
+}
+
+fheroes2::Rect Battle::Interface::_getMoatMask( const Cell & cell )
+{
+    // Bottom part of the cell, inset horizontally
+    constexpr int waterTopOffset = 34; // from cell top
+    constexpr int waterHeight = 14;
+    constexpr int insetX = 6;
+
+    const auto & pos = cell.GetPos();
+
+    return {
+        pos.x + insetX,
+        pos.y + waterTopOffset,
+        Cell::widthPx - insetX,
+        waterHeight,
+    };
+}
+
+const Battle::Cell * Battle::Interface::_getMoatVisualCell( const Unit & unit )
+{
+    const Position & pos = unit.GetPosition();
+
+    auto checkCell = [this]( const Cell * cell ) -> const Cell * {
+        if ( cell == nullptr ) {
+            return nullptr;
+        }
+
+        if ( _isMoatCell( *cell ) ) {
+            return cell;
+        }
+
+        // Check for horizontal adjacency
+        if ( const Cell * left = Board::GetCell( cell->GetIndex() - 1 ) ) {
+            if ( _isMoatCell( *left ) ) {
+                return left;
+            }
+        }
+
+        if ( const Cell * right = Board::GetCell( cell->GetIndex() + 1 ) ) {
+            if ( _isMoatCell( *right ) ) {
+                return right;
+            }
+        }
+
+        return nullptr;
+    };
+
+    if ( const Cell * moat = checkCell( pos.GetHead() ) ) {
+        return moat;
+    }
+
+    if ( unit.isWide() ) {
+        if ( const Cell * moat = checkCell( pos.GetTail() ) ) {
+            return moat;
+        }
+    }
+
+    return nullptr;
+}
+
+bool Battle::Interface::_isMoatCell( const Cell & cell )
+{
+    return std::find( moatCellIds.begin(), moatCellIds.end(), cell.GetIndex() ) != moatCellIds.end();
 }
 
 void Battle::Interface::RedrawTroopCount( const Unit & unit )
